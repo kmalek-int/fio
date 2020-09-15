@@ -1010,350 +1010,91 @@ static int fio_librpmaio_close_file(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
-static int aton(struct thread_data *td, const char *host,
-		     struct sockaddr_in *addr)
-{
-	if (inet_aton(host, &addr->sin_addr) != 1) {
-		struct hostent *hent;
-
-		hent = gethostbyname(host);
-		if (!hent) {
-			td_verror(td, errno, "gethostbyname");
-			return 1;
-		}
-
-		memcpy(&addr->sin_addr, hent->h_addr, 4);
-	}
-	return 0;
-}
-
-static int fio_librpmaio_setup_connect(struct thread_data *td, const char *host,
-				    unsigned short port)
-{
-	struct librpmaio_data *rd = td->io_ops_data;
-	struct fio_librpma_client_options *o = td->eo;
-	struct sockaddr_storage addrb;
-	struct ibv_recv_wr *bad_wr;
-	int err;
-
-	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
-
-	err = aton(td, host, &rd->addr);
-	if (err)
-		return err;
-
-	/* resolve route */
-	if (o->server_ip && strlen(o->server_ip)) {
-		addrb.ss_family = AF_INET;
-		err = aton(td, o->server_ip, (struct sockaddr_in *)&addrb);
-		if (err)
-			return err;
-		err = rdma_resolve_addr(rd->cm_id, (struct sockaddr *)&addrb,
-					(struct sockaddr *)&rd->addr, 2000);
-
-	} else {
-		err = rdma_resolve_addr(rd->cm_id, NULL,
-					(struct sockaddr *)&rd->addr, 2000);
-	}
-
-	if (err != 0) {
-		log_err("fio: rdma_resolve_addr: %d\n", err);
-		return 1;
-	}
-
-	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ADDR_RESOLVED);
-	if (err != 0) {
-		log_err("fio: get_next_channel_event: %d\n", err);
-		return 1;
-	}
-
-	/* resolve route */
-	err = rdma_resolve_route(rd->cm_id, 2000);
-	if (err != 0) {
-		log_err("fio: rdma_resolve_route: %d\n", err);
-		return 1;
-	}
-
-	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ROUTE_RESOLVED);
-	if (err != 0) {
-		log_err("fio: get_next_channel_event: %d\n", err);
-		return 1;
-	}
-
-	/* create qp and buffer */
-	if (fio_librpmaio_setup_qp(td) != 0)
-		return 1;
-
-	if (fio_librpmaio_setup_control_msg_buffers(td) != 0)
-		return 1;
-
-	/* post recv buf */
-	err = ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr);
-	if (err != 0) {
-		log_err("fio: ibv_post_recv fail: %d\n", err);
-		return 1;
-	}
-
-	return 0;
-}
-
-static int fio_librpmaio_setup_listen(struct thread_data *td, short port)
-{
-	struct librpmaio_data *rd = td->io_ops_data;
-	struct fio_librpma_client_options *o = td->eo;
-	struct ibv_recv_wr *bad_wr;
-	int state = td->runstate;
-
-	td_set_runstate(td, TD_SETTING_UP);
-
-	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
-
-	if (!o->server_ip || !strlen(o->server_ip))
-		rd->addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	else
-		rd->addr.sin_addr.s_addr = htonl(*o->server_ip);
-
-	/* rdma_listen */
-	if (rdma_bind_addr(rd->cm_id, (struct sockaddr *)&rd->addr) != 0) {
-		log_err("fio: rdma_bind_addr fail: %m\n");
-		return 1;
-	}
-
-	if (rdma_listen(rd->cm_id, 3) != 0) {
-		log_err("fio: rdma_listen fail: %m\n");
-		return 1;
-	}
-
-	log_info("fio: waiting for connection\n");
-
-	/* wait for CONNECT_REQUEST */
-	if (get_next_channel_event
-	    (td, rd->cm_channel, RDMA_CM_EVENT_CONNECT_REQUEST) != 0) {
-		log_err("fio: wait for RDMA_CM_EVENT_CONNECT_REQUEST\n");
-		return 1;
-	}
-
-	if (fio_librpmaio_setup_qp(td) != 0)
-		return 1;
-
-	if (fio_librpmaio_setup_control_msg_buffers(td) != 0)
-		return 1;
-
-	/* post recv buf */
-	if (ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr) != 0) {
-		log_err("fio: ibv_post_recv fail: %m\n");
-		return 1;
-	}
-
-	td_set_runstate(td, state);
-	return 0;
-}
-
-static int check_set_rlimits(struct thread_data *td)
-{
-#ifdef CONFIG_RLIMIT_MEMLOCK
-	struct rlimit rl;
-
-	/* check RLIMIT_MEMLOCK */
-	if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
-		log_err("fio: getrlimit fail: %d(%s)\n",
-			errno, strerror(errno));
-		return 1;
-	}
-
-	/* soft limit */
-	if ((rl.rlim_cur != RLIM_INFINITY)
-	    && (rl.rlim_cur < td->orig_buffer_size)) {
-		log_err("fio: soft RLIMIT_MEMLOCK is: %" PRId64 "\n",
-			rl.rlim_cur);
-		log_err("fio: total block size is:    %zd\n",
-			td->orig_buffer_size);
-		/* try to set larger RLIMIT_MEMLOCK */
-		rl.rlim_cur = rl.rlim_max;
-		if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
-			log_err("fio: setrlimit fail: %d(%s)\n",
-				errno, strerror(errno));
-			log_err("fio: you may try enlarge MEMLOCK by root\n");
-			log_err("# ulimit -l unlimited\n");
-			return 1;
-		}
-	}
-#endif
-
-	return 0;
-}
-
-static int compat_options(struct thread_data *td)
-{
-	// The original RDMA engine had an ugly / seperator
-	// on the filename for it's options. This function
-	// retains backwards compatibility with it. Note we do not
-	// support setting the bindname option is this legacy mode.
-
-	struct fio_librpma_client_options *o = td->eo;
-	char *modep, *portp;
-	char *filename = td->o.filename;
-
-	if (!filename)
-		return 0;
-
-	portp = strchr(filename, '/');
-	if (portp == NULL)
-		return 0;
-
-	*portp = '\0';
-	portp++;
-
-	o->server_port = portp;
-	/* XXX: port validation ...?
-	if (!o->server_port || o->server_port > 65535)
-		goto bad_host;*/
-
-	modep = strchr(portp, '/');
-	if (modep != NULL) {
-		*modep = '\0';
-		modep++;
-	}
-
-	/* XXX: do we need this?
-	if (modep) {
-		if (!strncmp("rdma_write", modep, strlen(modep)) ||
-		    !strncmp("RDMA_WRITE", modep, strlen(modep)))
-			o->verb = FIO_RDMA_MEM_WRITE;
-		else if (!strncmp("rdma_read", modep, strlen(modep)) ||
-			 !strncmp("RDMA_READ", modep, strlen(modep)))
-			o->verb = FIO_RDMA_MEM_READ;
-		else if (!strncmp("send", modep, strlen(modep)) ||
-			 !strncmp("SEND", modep, strlen(modep)))
-			o->verb = FIO_RDMA_CHA_SEND;
-		else
-			goto bad_host;
-	} else
-		o->verb = FIO_RDMA_MEM_WRITE;
-	*/
-
-	return 0;
-
-bad_host:
-	log_err("fio: bad rdma host/port/protocol: %s\n", td->o.filename);
-	return 1;
-}
-
 static int fio_librpmaio_init(struct thread_data *td)
 {
 	struct librpmaio_data *rd = td->io_ops_data;
 	struct fio_librpma_client_options *o = td->eo;
+	struct ibv_context *dev = NULL;
 	int ret;
 
-	if (td_rw(td)) {
-		log_err("fio: rdma connections must be read OR write\n");
-		return 1;
-	}
-	if (td_random(td)) {
-		log_err("fio: RDMA network IO can't be random\n");
-		return 1;
-	}
+	/* Get IBV context for the server IP */	
+	ret = rpma_utils_get_ibv_context(o->server_ip, RPMA_UTIL_IBV_CONTEXT_REMOTE,
+			                 &dev);
+	if (ret)
+                return ret;
 
-	if (compat_options(td))
-		return 1;
-
-	if (!o->server_port) {
-		log_err("fio: no port has been specified which is required "
-			"for the rdma engine\n");
-		return 1;
-	}
-
-	if (check_set_rlimits(td))
-		return 1;
-
-	/*rd->librpma_protocol = o->verb;*/
-	rd->cq_event_num = 0;
-
-	rd->cm_channel = rdma_create_event_channel();
-	if (!rd->cm_channel) {
-		log_err("fio: rdma_create_event_channel fail: %m\n");
-		return 1;
-	}
-
-	ret = rdma_create_id(rd->cm_channel, &rd->cm_id, rd, RDMA_PS_TCP);
-	if (ret) {
-		log_err("fio: rdma_create_id fail: %m\n");
-		return 1;
-	}
-
-	if ((rd->librpma_protocol == FIO_RDMA_MEM_WRITE) ||
-	    (rd->librpma_protocol == FIO_RDMA_MEM_READ)) {
-		rd->rmt_us =
-			malloc(FIO_RDMA_MAX_IO_DEPTH * sizeof(struct remote_u));
-		memset(rd->rmt_us, 0,
-			FIO_RDMA_MAX_IO_DEPTH * sizeof(struct remote_u));
-		rd->rmt_nr = 0;
-	}
-
-	rd->io_us_queued = malloc(td->o.iodepth * sizeof(struct io_u *));
-	memset(rd->io_us_queued, 0, td->o.iodepth * sizeof(struct io_u *));
-	rd->io_u_queued_nr = 0;
-
-	rd->io_us_flight = malloc(td->o.iodepth * sizeof(struct io_u *));
-	memset(rd->io_us_flight, 0, td->o.iodepth * sizeof(struct io_u *));
-	rd->io_u_flight_nr = 0;
-
-	rd->io_us_completed = malloc(td->o.iodepth * sizeof(struct io_u *));
-	memset(rd->io_us_completed, 0, td->o.iodepth * sizeof(struct io_u *));
-	rd->io_u_completed_nr = 0;
-
-	if (td_read(td)) {	/* READ as the server */
-		rd->is_client = 0;
-		td->flags |= TD_F_NO_PROGRESS;
-		/* server rd->rdma_buf_len will be setup after got request */
-		ret = fio_librpmaio_setup_listen(td, o->server_port);
-	} else {		/* WRITE as the client */
-		rd->is_client = 1;
-		ret = fio_librpmaio_setup_connect(td, td->o.filename, o->server_port);
-	}
+	/* Create new peer */
+	ret = rpma_peer_new(dev, &rd->peer);
 	return ret;
+ 
 }
 static int fio_librpmaio_post_init(struct thread_data *td)
 {
-	unsigned int max_bs;
-	int i;
 	struct librpmaio_data *rd = td->io_ops_data;
+	struct fio_librpma_client_options *o = td->eo;
+	struct rpma_conn_req *req = NULL;
+	enum rpma_conn_event conn_event = RPMA_CONN_UNDEFINED;
+	const char *msg = "Hello server!";
+	struct rpma_conn_private_data pdata;
+	rpma_mr_descriptor *desc;
+	size_t src_size = 0;
+	int ret;
 
-	max_bs = max(td->o.max_bs[DDIR_READ], td->o.max_bs[DDIR_WRITE]);
-	rd->send_buf.max_bs = htonl(max_bs);
+	/* Create a connection request */
+	ret = rpma_conn_req_new(rd->peer, o->server_ip, 
+				o->server_port, NULL, &req);
+	if (ret)
+		goto err_peer_delete;
 
-	/* register each io_u in the free list */
-	for (i = 0; i < td->io_u_freelist.nr; i++) {
-		struct io_u *io_u = td->io_u_freelist.io_us[i];
+	/* connect the connection request and obtain the connection object */
+	pdata.ptr = (void *)msg;
+	pdata.len = (strlen(msg) + 1) * sizeof(char);
+	ret = rpma_conn_req_connect(&req, &pdata, &rd->conn);
+	if (ret)
+		goto err_req_delete;
 
-		io_u->engine_data = malloc(sizeof(struct librpma_io_u_data));
-		memset(io_u->engine_data, 0, sizeof(struct librpma_io_u_data));
-		((struct librpma_io_u_data *)io_u->engine_data)->wr_id = i;
-
-		io_u->mr = ibv_reg_mr(rd->pd, io_u->buf, max_bs,
-				      IBV_ACCESS_LOCAL_WRITE |
-				      IBV_ACCESS_REMOTE_READ |
-				      IBV_ACCESS_REMOTE_WRITE);
-		if (io_u->mr == NULL) {
-			log_err("fio: ibv_reg_mr io_u failed: %m\n");
-			return 1;
-		}
-
-		rd->send_buf.rmt_us[i].buf =
-		    cpu_to_be64((uint64_t) (unsigned long)io_u->buf);
-		rd->send_buf.rmt_us[i].rkey = htonl(io_u->mr->rkey);
-		rd->send_buf.rmt_us[i].size = htonl(max_bs);
-
-#if 0
-		log_info("fio: Send rkey %x addr %" PRIx64 " len %d to client\n", io_u->mr->rkey, io_u->buf, max_bs); */
-#endif
+	/* wait for the connection to establish */
+	ret = rpma_conn_next_event(rd->conn, &conn_event);
+	if (ret) {
+		goto err_conn_delete;
+	} else if (conn_event != RPMA_CONN_ESTABLISHED) {
+		goto err_conn_delete;
 	}
 
-	rd->send_buf.nr = htonl(i);
+	/* here you can use the newly established connection */
+	(void) rpma_conn_get_private_data(rd->conn, &pdata);
+
+	/*
+	 * Create a remote memory registration structure from the received
+	 * descriptor.
+	 */
+	desc = pdata.ptr; 
+	ret = rpma_mr_remote_from_descriptor(desc, &rd->mr_remote);
+	if (ret)
+		goto err_conn_disconnect;
+
+	/* get the remote memory region size */
+	ret = rpma_mr_remote_get_size(rd->mr_remote, &src_size);
+	if (ret)
+		goto err_mr_remote_delete;
 
 	return 0;
+
+err_mr_remote_delete:
+	/* delete the remote memory region's structure */
+	(void) rpma_mr_remote_delete(&rd->mr_remote);
+err_conn_disconnect:
+	(void) rpma_conn_disconnect(rd->conn);
+err_conn_delete:
+	(void) rpma_conn_delete(&rd->conn);
+err_req_delete:
+	if (req)
+		(void) rpma_conn_req_delete(&req);
+err_peer_delete:
+	(void) rpma_peer_delete(&rd->peer);
+
+	return ret;
+
 }
 
 static void fio_librpmaio_cleanup(struct thread_data *td)
