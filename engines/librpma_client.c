@@ -890,7 +890,6 @@ static int fio_librpmaio_close_file(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
-
 static int fio_librpmaio_init(struct thread_data *td)
 {
 	struct librpmaio_data *rd = td->io_ops_data;
